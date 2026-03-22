@@ -1,0 +1,173 @@
+// ══════════════════════════════════════════════════════════════════════════════
+//  Grafana Alloy — log collection pipeline
+//  Spring Boot → logstash-logback-encoder → JSON file → Alloy → Loki
+//
+//  Host volume mount (docker-compose.yml):
+//    ./logs:/var/log/spring
+//
+//  Expected log file:
+//    /var/log/spring/spring-boot-logging-grafana-alloy-loki.log
+//
+//  Produced by HttpLoggingFilter / OutgoingHttpLoggingInterceptor with
+//  logstash-logback-encoder (LogstashEncoder).
+// ══════════════════════════════════════════════════════════════════════════════
+
+logging {
+  level  = "info"
+  format = "logfmt"
+}
+
+// ── File discovery ────────────────────────────────────────────────────────────
+
+local.file_match "spring_logs" {
+  // Matches all .log files written by the rolling appender.
+  // The Spring app writes to ./logs/ (logging.http.log-dir=logs), which maps
+  // to /var/log/spring inside this container.
+  path_targets = [{ __path__ = "/var/log/spring/*.log" }]
+  sync_period  = "5s"
+}
+
+loki.source.file "spring_source" {
+  targets    = local.file_match.spring_logs.targets
+  forward_to = [loki.process.springboot_pipeline.receiver]
+  // tail_from_end=true skips historical lines on first discovery.
+  // Set to false in dev if you want Alloy to ingest pre-existing content.
+  tail_from_end = true
+}
+
+// ── Processing pipeline ───────────────────────────────────────────────────────
+
+loki.process "springboot_pipeline" {
+  forward_to = [loki.write.grafana_loki.receiver]
+
+  // ── Stage 1: Parse JSON ───────────────────────────────────────────────────
+  //
+  // logstash-logback-encoder produces single-line JSON with these top-level
+  // fields.  Keys containing "@" or "." require backtick (raw-string) JMESPath
+  // expressions so River does not interpret the special characters.
+  //
+  // Field origin reference:
+  //   LogstashEncoder fieldNames config → level, logger, thread, message,
+  //                                        error.stack_trace
+  //   LogstashEncoder customFields      → application.name, application.version,
+  //                                        environment
+  //   MDC (set by HttpLoggingFilter)    → traceId, correlationId
+  //   Markers.appendEntries (filter)    → event.kind, http.method, http.url,
+  //                                        http.query, http.status_code,
+  //                                        http.target, event.duration, client.ip
+  //                                        http.request.headers.*,
+  //                                        http.response.headers.*,
+  //                                        http.request.body, http.response.body
+  stage.json {
+    expressions = {
+      // ── Logback standard fields ──────────────────────────────────────────
+      timestamp           = `"@timestamp"`,     // ISO-8601 nanosecond precision
+      level               = "level",            // TRACE / DEBUG / INFO / WARN / ERROR
+      logger              = "logger",           // fully-qualified class name
+      thread              = "thread",
+      message             = "message",          // "HTTP GET /api/books -> 200 (42ms)"
+      error_stack_trace   = `"error.stack_trace"`,
+
+      // ── Application identity (logback customFields) ──────────────────────
+      application_name    = `"application.name"`,
+      application_version = `"application.version"`,
+      environment         = "environment",      // spring.profiles.active
+
+      // ── Distributed tracing (MDC) ────────────────────────────────────────
+      traceId             = "traceId",
+      correlationId       = "correlationId",
+
+      // ── HTTP exchange (both inbound and outbound) ────────────────────────
+      event_kind          = `"event.kind"`,     // "inbound" | "outbound"
+      http_method         = `"http.method"`,    // GET, POST, …
+      http_url            = `"http.url"`,       // request URI path
+      http_query          = `"http.query"`,     // raw query string
+      http_status         = `"http.status_code"`,
+      http_target         = `"http.target"`,    // full URL — outbound calls only
+      event_duration      = `"event.duration"`, // milliseconds
+      client_ip           = `"client.ip"`,
+    }
+  }
+
+  // ── Stage 2: Stream labels (low-cardinality only) ─────────────────────────
+  //
+  // Each unique label combination creates a distinct Loki stream.
+  // Too many streams → index bloat and poor query performance.
+  //
+  // Safe choices (bounded value sets):
+  //   level            → TRACE | DEBUG | INFO | WARN | ERROR   (5 values)
+  //   application_name → one value per deployed service
+  //   environment      → dev | staging | prod                   (≤5 values)
+  //   event_kind       → inbound | outbound                     (2 values)
+  //
+  // Avoid as labels: traceId, correlationId, http_url, client_ip — all
+  // unbounded / high-cardinality → use structured_metadata instead.
+  stage.labels {
+    values = {
+      level            = "level",
+      application_name = "application_name",
+      environment      = "environment",
+      event_kind       = "event_kind",
+    }
+  }
+
+  // ── Stage 3: Structured metadata (high-cardinality, still queryable) ──────
+  //
+  // Structured metadata is stored per log line, not per stream.
+  // Loki indexes it separately, enabling queries like:
+  //   {application_name="…"} | traceId="abc-123"
+  //   {event_kind="outbound"} | http_status="500"
+  // without creating a new stream for every distinct value.
+  //
+  // Requires Loki ≥ 2.9 with limits_config.allow_structured_metadata=true
+  // (already enabled in docker/loki/local-config.yaml).
+  stage.structured_metadata {
+    values = {
+      traceId           = "traceId",
+      correlationId     = "correlationId",
+      logger            = "logger",
+      thread            = "thread",
+      http_method       = "http_method",
+      http_url          = "http_url",
+      http_query        = "http_query",
+      http_status       = "http_status",
+      http_target       = "http_target",
+      event_duration    = "event_duration",
+      client_ip         = "client_ip",
+      error_stack_trace = "error_stack_trace",
+    }
+  }
+
+  // ── Stage 4: Override Loki's ingestion timestamp ──────────────────────────
+  //
+  // Uses @timestamp from the JSON payload rather than the wall-clock time
+  // at ingestion, so log ordering is correct even after a restart/backfill.
+  // RFC3339Nano matches logback's timestampPattern:
+  //   "yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSSXXX"
+  //   e.g. 2026-03-21T21:27:19.571043105+01:00
+  stage.timestamp {
+    source = "timestamp"
+    format = "RFC3339Nano"
+  }
+
+  // ── Stage 5: Set the visible log line ────────────────────────────────────
+  //
+  // Loki stores one text "line" per entry; everything else is metadata.
+  // Using the human-readable message keeps Explore readable:
+  //   "HTTP POST /api/books -> 201 (42ms)"
+  //   "HTTP OUT GET https://api.example.com/data -> 200 (15ms)"
+  stage.output {
+    source = "message"
+  }
+}
+
+// ── Loki writer ───────────────────────────────────────────────────────────────
+
+loki.write "grafana_loki" {
+  endpoint {
+    url        = "http://loki:3100/loki/api/v1/push"
+    tenant_id  = "default"
+    batch_wait = "1s"
+    batch_size = "1MB"
+  }
+}

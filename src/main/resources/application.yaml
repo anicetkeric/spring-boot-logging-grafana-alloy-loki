@@ -1,0 +1,61 @@
+spring:
+  application:
+    name: spring-boot-logging-grafana-alloy-loki
+    version: 0.0.1-SNAPSHOT
+  profiles:
+    active: prod
+  jackson:
+    serialization:
+      indent-output: true
+  datasource:
+    type: com.zaxxer.hikari.HikariDataSource
+    url: jdbc:h2:mem:demo_db;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    username: sa
+    password:
+    hikari:
+      poolName: Hikari
+      auto-commit: false
+  h2:
+    console:
+      enabled: true
+  jpa:
+    database-platform: org.hibernate.dialect.H2Dialect
+    show-sql: true
+    defer-datasource-initialization: true
+    hibernate:
+      ddl-auto: 'create-drop'
+  sql:
+    init:
+      mode: ALWAYS
+
+# ── HTTP Logging ──────────────────────────────────────────────────────────────
+logging:
+  # Application log level (set to DEBUG to emit request/response bodies)
+  level:
+    com.bootlabs: INFO
+
+  # Custom HTTP logging filter settings (bound to LoggingProperties)
+  http:
+    # Set to true to include request and response bodies in every log event.
+    # Applies to both inbound (HttpLoggingFilter) and outbound (RestClient) calls.
+    # Bodies are only logged for loggable content-types (JSON, XML, text, form).
+    # Keep false in production to avoid logging sensitive payloads.
+    log-body: true
+    # Max characters cached and logged for any single request or response body.
+    # Bodies exceeding this are truncated with "...[truncated]" appended.
+    max-body-size: 10000
+    # URI prefixes skipped by the logging filter entirely.
+    excluded-paths:
+      - /actuator
+      - /health
+    # Directory where the rolling log file is written (relative to CWD or absolute).
+    # Must match the host-side path in the Alloy volume mount:
+    #   docker-compose.yml → ./logs:/var/log/spring
+    log-dir: logs
+
+  # Rolling policy (referenced by logback-spring.xml via springProperty)
+  logback:
+    rollingpolicy:
+      max-file-size: 100MB   # rotate when a single file reaches this size
+      max-history: 30        # keep at most N daily archives
+      total-size-cap: 3GB    # hard cap on total archive disk usage

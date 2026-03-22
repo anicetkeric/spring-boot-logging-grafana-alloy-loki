@@ -1,0 +1,148 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  logback-spring.xml
+  ══════════════════
+  Structured JSON logging for Grafana Alloy → Loki (and ELK / OpenSearch).
+
+  All log events are written as single-line JSON to:
+    .log/<application-name>.log
+
+  The file rolls daily AND when it reaches MAX_FILE_SIZE.
+  Compressed archives (*.log.gz) are kept for MAX_HISTORY days,
+  subject to TOTAL_SIZE_CAP.
+
+  A second JSON appender (JSON_CONSOLE) is active on every profile
+  except "prod", giving readable structured output during development.
+
+  Field layout (flat dot-notation):
+    @timestamp, @version, message
+    application.name, application.version, environment
+    level, logger, thread
+    traceId, correlationId          ← from MDC (set by HttpLoggingFilter)
+    http.method, http.url, http.query, http.status_code
+    event.duration, client.ip
+    http.request.headers.*          ← per-header flat fields
+    http.response.headers.*
+    http.request.body               ← DEBUG only, loggable content-types
+    http.response.body              ← DEBUG only, loggable content-types
+    error.stack_trace               ← on exceptions
+-->
+<configuration>
+
+    <!-- ══ Spring property bindings ════════════════════════════════════════ -->
+    <springProperty name="APP_NAME"        source="spring.application.name"                           defaultValue="application"/>
+    <springProperty name="APP_VERSION"     source="spring.application.version"                        defaultValue="unknown"/>
+    <springProperty name="ENVIRONMENT"     source="spring.profiles.active"                            defaultValue="default"/>
+    <springProperty name="LOG_DIR"         source="logging.http.log-dir"                              defaultValue=".log"/>
+    <springProperty name="MAX_HISTORY"     source="logging.logback.rollingpolicy.max-history"         defaultValue="30"/>
+    <springProperty name="MAX_FILE_SIZE"   source="logging.logback.rollingpolicy.max-file-size"       defaultValue="100MB"/>
+    <springProperty name="TOTAL_SIZE_CAP"  source="logging.logback.rollingpolicy.total-size-cap"      defaultValue="3GB"/>
+
+    <!-- ══ Shared encoder snippet (via <encoder> duplication — Logback has no
+            native encoder-ref, so we repeat the config for file vs console) ═ -->
+
+    <!-- ── FILE appender ──────────────────────────────────────────────────── -->
+    <appender name="JSON_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/${APP_NAME}.log</file>
+        <append>true</append>
+
+        <!-- Daily + size-based rotation with compressed archives -->
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <!-- e.g. .log/spring-boot-logging-grafana-alloy-loki.2026-03-21.0.log.gz -->
+            <fileNamePattern>${LOG_DIR}/${APP_NAME}.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
+            <maxFileSize>${MAX_FILE_SIZE}</maxFileSize>
+            <maxHistory>${MAX_HISTORY}</maxHistory>
+            <totalSizeCap>${TOTAL_SIZE_CAP}</totalSizeCap>
+            <!-- Remove stale archives on startup (safe for containers) -->
+            <cleanHistoryOnStart>true</cleanHistoryOnStart>
+        </rollingPolicy>
+
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <!--
+              ISO-8601 with nanosecond precision and timezone offset.
+              Example: 2026-03-21T21:27:19.571043105+01:00
+              Uses DateTimeFormatter patterns: S = fractional-second digit.
+            -->
+            <timestampPattern>yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSSXXX</timestampPattern>
+
+            <!-- Rename standard logstash field names to match the spec -->
+            <fieldNames>
+                <timestamp>@timestamp</timestamp>
+                <version>@version</version>
+                <message>message</message>
+                <logger>logger</logger>
+                <thread>thread</thread>
+                <level>level</level>
+                <!-- levelValue is redundant alongside level — exclude it -->
+                <levelValue>[ignore]</levelValue>
+                <stackTrace>error.stack_trace</stackTrace>
+            </fieldNames>
+
+            <!--
+              Static fields present on EVERY log line.
+              These are resolved once at startup from Spring's environment.
+              Kept as a small nested object (application.name / .version)
+              to match ECS-style naming without high cardinality.
+            -->
+            <customFields>{"application.name":"${APP_NAME}","application.version":"${APP_VERSION}","environment":"${ENVIRONMENT}"}</customFields>
+
+            <!--
+              MDC fields: traceId and correlationId are populated by
+              HttpLoggingFilter for every request. They are included
+              automatically by LogstashEncoder (all MDC keys are included
+              by default), so no explicit <includeMdcKeyName> is needed.
+            -->
+
+            <!-- Single-line JSON — the default; no PrettyPrintingDecorator -->
+        </encoder>
+    </appender>
+
+    <!-- ── CONSOLE appender (dev / non-prod profiles only) ────────────────── -->
+    <springProfile name="!prod">
+        <appender name="JSON_CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+            <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+                <timestampPattern>yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSSXXX</timestampPattern>
+                <fieldNames>
+                    <timestamp>@timestamp</timestamp>
+                    <version>@version</version>
+                    <message>message</message>
+                    <logger>logger</logger>
+                    <thread>thread</thread>
+                    <level>level</level>
+                    <levelValue>[ignore]</levelValue>
+                    <stackTrace>error.stack_trace</stackTrace>
+                </fieldNames>
+                <customFields>{"application.name":"${APP_NAME}","application.version":"${APP_VERSION}","environment":"${ENVIRONMENT}"}</customFields>
+            </encoder>
+        </appender>
+    </springProfile>
+
+    <!-- ══ Logger tuning ═══════════════════════════════════════════════════ -->
+
+    <!--
+      Suppress noisy framework loggers that would pollute the log stream
+      and add no value for HTTP-level observability.
+    -->
+    <logger name="org.hibernate.SQL"                level="WARN"/>
+    <logger name="org.hibernate.orm.jdbc.bind"      level="WARN"/>
+    <logger name="org.springframework.web"          level="WARN"/>
+    <logger name="org.springframework.security"     level="WARN"/>
+
+    <!-- ══ Root loggers per profile ════════════════════════════════════════ -->
+
+    <!-- Production: file only -->
+    <springProfile name="prod">
+        <root level="INFO">
+            <appender-ref ref="JSON_FILE"/>
+        </root>
+    </springProfile>
+
+    <!-- Every other profile: file + console -->
+    <springProfile name="!prod">
+        <root level="INFO">
+            <appender-ref ref="JSON_FILE"/>
+            <appender-ref ref="JSON_CONSOLE"/>
+        </root>
+    </springProfile>
+
+</configuration>
